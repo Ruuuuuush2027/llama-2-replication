@@ -20,7 +20,7 @@ class ModelArgs:
     max_batch_size: int = 4
     max_seq_len: int = 1024
 
-    device: Optional[str] = None
+    device: Optional[str] = "cuda"
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     assert head_dim % 2 == 0, "the embedding dim must be even for RoPE to work"
@@ -94,16 +94,17 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias = False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device, dtype=torch.float16) 
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device, dtype=torch.float16) 
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device, dtype=torch.get_default_dtype())
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device, dtype=torch.get_default_dtype())
     
-    # seq len 1 assume just decoding, training needs to be like normal full
+    # self.training -> normal full forward over the whole sequence, no kv cache
+    # eval -> kv cache, seq_len 1 for decoding or seq_len > 1 for prefilling the prompt
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-        batch_size, seq_len, _ = x.shape # (batch, 1, dim)
+        batch_size, seq_len, _ = x.shape # (batch, seq_len, dim)
 
-        xq = self.wq(x) # (batch, 1, self.n_heads_q * head_dim)
-        xk = self.wk(x) # (batch, 1, self.n_kv_heads * head_dim)
-        xv = self.wv(x) # (batch, 1, self.n_kv_heads * head_dim)
+        xq = self.wq(x) # (batch, seq_len, self.n_heads_q * head_dim)
+        xk = self.wk(x) # (batch, seq_len, self.n_kv_heads * head_dim)
+        xv = self.wv(x) # (batch, seq_len, self.n_kv_heads * head_dim)
 
         xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
         xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
@@ -113,28 +114,43 @@ class SelfAttention(nn.Module):
         xq = apply_rotary_embeddings(xq, freqs_complex, device = x.device)
         xk = apply_rotary_embeddings(xk, freqs_complex, device = x.device)
 
-        # kv cache handling
-        self.cache_k[:batch_size, start_pos:start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos:start_pos + seq_len] = xv
+        if self.training:
+            # attend within the current sequence only, cache is not touched (in-place writes would break autograd)
+            keys = xk
+            values = xv
+        else:
+            # kv cache handling
+            self.cache_k[:batch_size, start_pos:start_pos + seq_len] = xk
+            self.cache_v[:batch_size, start_pos:start_pos + seq_len] = xv
 
-        # compute
-        keys = self.cache_k[:batch_size, 0:start_pos + seq_len]
-        values = self.cache_v[:batch_size, 0:start_pos + seq_len]
+            # compute
+            keys = self.cache_k[:batch_size, 0:start_pos + seq_len]
+            values = self.cache_v[:batch_size, 0:start_pos + seq_len]
 
         keys = repeat_kv(keys, self.n_rep)
         values = repeat_kv(values, self.n_rep)
 
-        xq = xq.transpose(1, 2) # (batch, 1, self.n_heads_q, head_dim) -> (batch, self.n_heads_q, 1, head_dim)
+        xq = xq.transpose(1, 2) # (batch, seq_len, self.n_heads_q, head_dim) -> (batch, self.n_heads_q, seq_len, head_dim)
         keys = keys.transpose(1, 2) # (batch, self.n_heads_q, seq_len_kv, head_dim)
-        values = values.transpose(1, 2) # (batch, self.n_heads_q, seq_len_kv, head_dim), seq_len_kv is number of entries in kv cache
+        values = values.transpose(1, 2) # (batch, self.n_heads_q, seq_len_kv, head_dim), seq_len_kv = seq_len in training, number of cache entries in eval
 
-        # (batch, self.n_heads_q, 1, head_dim) @ (batch, self.n_heads_q, head_dim, seq_len_kv) -> (batch, self.n_heads_q, 1, seq_len_kv)
+        # (batch, self.n_heads_q, seq_len, head_dim) @ (batch, self.n_heads_q, head_dim, seq_len_kv) -> (batch, self.n_heads_q, seq_len, seq_len_kv)
         scores = torch.matmul(xq, keys.transpose(2, 3) / math.sqrt(self.head_dim))
-        scores = F.softmax(scores.float(), dim = -1).type_as(xq)
-        # (batch, self.n_heads_q, 1, seq_len_kv) @ (batch, self.n_heads_q, seq_len_kv, head_dim) -> (batch, self.n_heads_q, 1, head_dim)
+        scores = scores.float()
+
+        # causal mask, only needed when more than one query token (decoding with 1 token can see the whole cache)
+        # query i sits at position seq_len_kv - seq_len + i, so it can see keys up to that position
+        if seq_len > 1:
+            seq_len_kv = keys.shape[2]
+            mask = torch.full((seq_len, seq_len_kv), float('-inf'), device = x.device, dtype = torch.float32)
+            mask = torch.triu(mask, diagonal = seq_len_kv - seq_len + 1) # (seq_len, seq_len_kv), broadcast over batch and heads
+            scores = scores + mask
+
+        scores = F.softmax(scores, dim = -1).type_as(xq)
+        # (batch, self.n_heads_q, seq_len, seq_len_kv) @ (batch, self.n_heads_q, seq_len_kv, head_dim) -> (batch, self.n_heads_q, seq_len, head_dim)
         output = torch.matmul(scores, values)
 
-        output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)) # (batch, 1, self.n_heads_q * head_dim = hidden_dim)
+        output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)) # (batch, seq_len, self.n_heads_q * head_dim = hidden_dim)
         return self.wo(output)
 
 class FeedForward(nn.Module): # feed forward with SwiGLU
@@ -206,10 +222,15 @@ class Transformer(nn.Module):
         # for RoPE compute compute, RoPE only apply on Q,K, which is intuitive indeed
         self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device = self.args.device)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         # (B, Seq_Len)
         batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time, we use KV Cache"
+        if self.training:
+            assert start_pos == 0, "Training is a full forward pass from position 0, no KV Cache"
+            assert seq_len <= self.freqs_complex.shape[0], "Sequence is longer than the precomputed RoPE frequencies"
+        else:
+            assert batch_size <= self.args.max_batch_size, "Batch is larger than the KV Cache"
+            assert start_pos + seq_len <= self.args.max_seq_len, "Sequence is longer than the KV Cache"
 
         # (B, Seq_Len) -> (B, Seq_Len, Dim)
         h = self.tok_embeddings(tokens)
